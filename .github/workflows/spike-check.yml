@@ -1,0 +1,47 @@
+name: Spike Done-Lock (Ground Rule 7)
+
+on:
+  issues:
+    types: [closed]
+
+jobs:
+  spike-check:
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.labels.*.name, 'spike')
+    steps:
+      - name: Check for linked formalization issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || '';
+
+            // Look for a linked formalization issue reference (e.g., #123)
+            const issueRefPattern = /#(\d+)/g;
+            const matches = body.match(issueRefPattern);
+
+            if (!matches) {
+              // Re-open the issue
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'open'
+              });
+
+              // Post a comment explaining why
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: '⚠️ **Ground Rule 7 — Spike Done-Lock**\n\n' +
+                  'This issue has the `spike` label and cannot be closed without ' +
+                  'a linked formalization issue.\n\n' +
+                  'To close this spike:\n' +
+                  '1. Create a formalization issue that captures the findings\n' +
+                  '2. Reference it in this issue body (e.g., "Formalization: #123")\n' +
+                  '3. Close this issue again after the formalization issue reaches "In Review"'
+              });
+
+              core.setFailed('Spike issue closed without linked formalization issue.');
+            }

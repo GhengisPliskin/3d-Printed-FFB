@@ -1,0 +1,20 @@
+# Default Configuration — 3D-Printed FFB Joystick
+# Calibration and operational parameters for ODrive S1 + GIM 8108-8 setup.
+# Override per-axis by creating pitch_config.yaml / roll_config.yaml.
+
+# Calibration parameters
+calibration:
+  # Number of index search attempts before failing
+  index_search_retries: 3
+  # Timeout (seconds) for each calibration step
+  step_timeout_s: 30
+  # Whether to verify center position after calibration
+  verify_center: true
+  # Acceptable center offset (encoder counts) — fail if exceeded
+  center_tolerance_counts: 50
+
+# Logging
+logging:
+  level: INFO          # DEBUG, INFO, WARNING, ERROR
+  log_to_file: true
+  log_file: logs/odrive_config.log

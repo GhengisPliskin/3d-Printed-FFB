@@ -1,0 +1,28 @@
+# ODrive S1 Hardware Configuration — GIM 8108-8 Planetary Gearbox BLDC
+# These values are applied to the ODrive S1 controller during configuration.
+# Reference: GIM 8108-8 datasheet + ODrive S1 documentation.
+
+motor:
+  pole_pairs: 21               # GIM 8108-8 pole pair count
+  kv_rating: 8                 # Motor KV rating (RPM/V) — verify against datasheet
+  current_limit: 10.0          # Amps — conservative limit for 3D printed structure
+  current_limit_margin: 8.0    # Amps — margin above current_limit before fault
+  torque_constant: null        # Nm/A — calculated from KV if null
+  motor_type: HIGH_CURRENT     # ODrive motor type enum
+
+encoder:
+  type: INCREMENTAL            # INCREMENTAL, HALL, or SPI_ABS
+  cpr: 4096                    # Counts per revolution — verify for your encoder
+  use_index: true              # Use index pulse for absolute position reference
+  index_search_speed: 1.0      # Turns/sec during index search
+
+controller:
+  control_mode: TORQUE_CONTROL # TORQUE_CONTROL for FFB application
+  input_mode: PASSTHROUGH      # Open FFB Configurator sends commands via CAN
+  bandwidth: 100.0             # Hz — controller bandwidth (tune conservatively)
+  vel_limit: 20.0              # Turns/sec — velocity limit for safety
+
+can:
+  node_id_pitch: 0             # CAN node ID for pitch axis ODrive
+  node_id_roll: 1              # CAN node ID for roll axis ODrive
+  baud_rate: 250000            # CAN bus baud rate (must match Open FFB board)

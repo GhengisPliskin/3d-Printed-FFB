@@ -1,0 +1,25 @@
+{
+  "output": {
+    "filePath": "repomix-output.txt"
+  },
+  "include": [
+    "src/**",
+    "tests/**",
+    "config/**",
+    "docs/**",
+    "ARCHITECTURE.md",
+    "CONSTRAINTS.md",
+    "CLAUDE.md"
+  ],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "*.stl",
+      "*.step",
+      "*.3mf",
+      "__pycache__/**",
+      ".venv/**"
+    ]
+  }
+}
