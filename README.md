@@ -6,7 +6,8 @@ A 2-axis (pitch + roll) force feedback joystick built from 3D-printed structural
 components. Uses GIM 8108-8 planetary gearbox BLDC motors driven by ODrive S1 motor
 controllers, with an Open FFB joystick board handling USB HID input and DirectInput
 force feedback effects. This project was inspired by the orginal Laser Wing FFB joystick, 
-redesigned for the available and lower cost GIM 8108-8 BLDC motors.
+redesigned for the available and lower cost GIM 8108-8 BLDC motors.  THis project uses the
+OpenFFB Board and its configurator: https://github.com/Ultrawipf/OpenFFBoard/
 
 ## Hardware
 
