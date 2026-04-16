@@ -8,6 +8,14 @@
 
 ---
 
+## Key Context
+
+> **The RMDX8 Pro had the same broken trim behavior before switching from the original driver to the ODrive S1.** The issues were corrected by the S1 migration and subsequent tuning. This confirms the problem is **controller tuning, not motor hardware.** The GIM's ODrive S1 is essentially running at near-default/untuned values — the same state the RMDX8 was in before its config was dialed in.
+>
+> **Implication:** The fix path is not "investigate what's wrong" — it's **"replicate the known fix."** Bring the GIM's S1 controller gains in line with the RMDX8's proven values, adjusted for hardware differences (lower inertia, different Kt, 48V vs 24V bus).
+
+---
+
 ## Action Items (Priority Order)
 
 > Items #1–#5 are almost certainly responsible for broken trim on the GIM.  
@@ -18,7 +26,7 @@
 The GIM has essentially zero velocity damping. The RMDX8 uses 3.0. This is the single largest behavioral difference. Without velocity gain, the stick drifts through trim forces because nothing resists movement. Gravity on the pitch axis pulls the stick down and the controller doesn't push back.
 
 - **Action:** Start at `vel_gain = 3.0`. Scale down if oscillation occurs (GIM has 75× less rotor inertia, so may need 1.5–2.0 instead).
-- **❓ Ask:** Was `vel_gain` intentionally set to 0.02 to avoid oscillation? If so, what oscillation was observed?
+- **❓ Ask:** Was `vel_gain` ever tuned on the GIM, or is 0.02 the value it shipped with? (Given the RMDX8 had the same issue pre-S1 tuning, this is likely an untouched default.)
 
 ### 🔴 #2 — vel_integrator_gain: 0.0 vs 2.2
 
@@ -37,7 +45,7 @@ GIM motor is hard-capped at 1 turn/s with `enable_vel_limit=true`. That's ~45°/
 The current loop governs how accurately the motor tracks torque commands. At 150 Hz the GIM can't follow rapid force changes — everything is sluggish.
 
 - **Action:** Increase to `1000` Hz. If audible noise appears, step down to 500 Hz.
-- **❓ Ask:** Was 150 Hz set to suppress noise? Specific symptoms would help determine the right target.
+- **❓ Ask:** Was 150 Hz deliberately set, or is this the value the GIM's ODrive shipped with? (ODrive S1 default is 1000 Hz — 150 Hz is non-standard.)
 
 ### 🔴 #5 — current_slew_rate_limit: 800 vs 10,000 A/s (12.5×)
 
