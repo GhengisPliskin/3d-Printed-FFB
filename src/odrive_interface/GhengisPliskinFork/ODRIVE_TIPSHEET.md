@@ -81,10 +81,17 @@ Swap USB cable, then:
 python odrive_setup.py --roll
 ```
 
+To include harmonic compensation and anti-cogging calibration (adds ~6 minutes per axis):
+
+```
+python odrive_setup.py --pitch --anticogging
+python odrive_setup.py --roll --anticogging
+```
+
 **What happens:** The script runs three phases automatically.
 
 1. **Phase 1** — Erases to factory defaults, writes all config (audit-corrected values from RMDX8 Pro V2 reference), saves, reboots.
-2. **Phase 2** — Runs full motor+encoder calibration, sets startup behavior, saves.
+2. **Phase 2** — Runs full motor+encoder calibration, sets startup behavior, saves. With `--anticogging`, Phase 2 also runs harmonic compensation followed by a full anti-cogging sweep.
 3. **Phase 3** — Reconnects and verifies all values persisted to flash. Auto-retries if the S1 dropped the save during reboot.
 
 Nothing moves until you press Enter. **Ctrl+C** at any time zeros torque and stops the motor.
@@ -115,7 +122,7 @@ python odrive_center.py --pitch
 python odrive_center.py --roll
 ```
 
-Hold the stick at physical center, press Enter. The script averages 10 encoder readings, writes the offset, and saves to flash.
+Hold the stick at physical center, press Enter. The script averages 10 mapped position readings, computes an incremental offset correction, saves to flash, and reboots the ODrive. The ODrive will disconnect and reconnect during reboot — this is expected.
 
 After centering, in the **OpenFFBoard configurator**:
 
@@ -156,6 +163,7 @@ These parameters were changed based on `MOTOR_COMPARISON.md` (RMDX8 Pro V2 refer
 | resistance_calib_max_voltage | 4.0 V | 8.0 V | — RMDX8 uses 8V for low-R motor |
 | input_filter_bandwidth | 100 Hz | 20 Hz | — match RMDX8 noise filter |
 | power_torque_report_filter_BW | 150 Hz | 8000 Hz | — telemetry bandwidth |
+| torque_constant | 1.00 Nm/A | 1.45 Nm/A | — static test: 8.27 / KV 5.7 |
 
 ---
 
