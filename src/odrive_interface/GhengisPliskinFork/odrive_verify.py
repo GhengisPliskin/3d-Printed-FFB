@@ -55,7 +55,7 @@ except (ImportError, AttributeError):
 EXPECTED = {
     # Motor core (datasheet)
     "pole_pairs": 21,
-    "torque_constant": 1.00,
+    "torque_constant": 1.45,
     "current_soft_max": 7.0,
     "current_hard_max": 25.0,
     "phase_r_ltn": 0.439,          # Datasheet phase-to-phase resistance

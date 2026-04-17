@@ -28,18 +28,20 @@ import sys
 import time
 
 
-def get_raw_position(ax):
+def get_mapped_position(ax):
     """
-    WHAT: Read the absolute encoder position estimate (un-offset).
-    WHY: The pos_estimate gives the raw encoder reading before the
-         pos_vel_mapper applies the offset. This is what we need to
-         record as the new zero reference — the physical center of
-         the stick assembly.
+    WHAT: Read the current mapped relative position from pos_vel_mapper.
+    WHY: pos_vel_mapper.pos_rel gives the gear-ratio-scaled position
+         after the current offset is applied. To zero the center, we
+         fold this residual back into the offset (divided by scale),
+         which is more robust than overwriting with raw pos_estimate —
+         it works incrementally regardless of current offset state and
+         correctly accounts for the gearbox scale factor.
     ARGS: ax — ODrive axis object.
-    RETURNS: Float — raw encoder position estimate.
+    RETURNS: Float — mapped relative position (output shaft turns).
     FMEA: C-006 — Center position must be accurate before enabling forces.
     """
-    return ax.pos_estimate
+    return ax.pos_vel_mapper.pos_rel
 
 
 def main():
@@ -104,20 +106,22 @@ def main():
     print(f"  Press Enter when centered...", end="")
     input()
 
-    # ── Sample the encoder position ──────────────────────────────
+    # ── Sample the mapped position ──────────────────────────────
     # Take 10 readings over 500ms and average them. This reduces
     # noise from encoder quantization and electrical interference.
-    # If the spread is too large, the user is probably still moving
-    # the stick or there's an encoder problem.
+    # We read pos_vel_mapper.pos_rel (the gear-ratio-scaled position
+    # after current offset), not raw pos_estimate. The residual is
+    # then folded back into the offset, divided by scale, to zero
+    # the center incrementally.
     readings = []
     for _ in range(10):
-        readings.append(get_raw_position(ax))
+        readings.append(get_mapped_position(ax))
         time.sleep(0.05)
 
-    center_pos = sum(readings) / len(readings)
+    mapped_pos = sum(readings) / len(readings)
     spread = max(readings) - min(readings)
 
-    print(f"  Absolute raw position at center: {center_pos:.4f} (spread: {spread:.4f})")
+    print(f"  Mapped relative position at center: {mapped_pos:.4f} (spread: {spread:.4f})")
 
     # A spread > 0.01 turns indicates the position is noisy.
     # This could mean the user is still moving, the encoder has
@@ -127,12 +131,19 @@ def main():
         if input("  Use this value anyway? (y/n): ").strip().lower() != 'y':
             sys.exit(0)
 
-    # ── Write the new offset ─────────────────────────────────────
-    # The offset tells the pos_vel_mapper where zero is. After setting
-    # this, pos_vel_mapper.pos_rel should read ~0.0 when the stick
-    # is at physical center.
-    print(f"  Setting new offset to {center_pos:.4f}...")
-    ax.pos_vel_mapper.config.offset = center_pos
+    # ── Compute and write the new offset ─────────────────────────
+    # The pos_vel_mapper computes: pos_rel = (raw - offset) * scale
+    # To zero pos_rel at the current position, we solve for the new
+    # offset: new_offset = current_offset + (mapped_pos / scale)
+    # This incremental approach works regardless of the current offset
+    # state and correctly accounts for the gearbox scale factor.
+    current_offset = ax.pos_vel_mapper.config.offset
+    scale = ax.pos_vel_mapper.config.scale
+    new_offset = current_offset + (mapped_pos / scale)
+
+    print(f"  Current offset: {current_offset:.4f}, scale: {scale:.4f}")
+    print(f"  New offset: {new_offset:.4f}")
+    ax.pos_vel_mapper.config.offset = new_offset
     ax.pos_vel_mapper.config.offset_valid = True
 
     # Verify the relative position is now mathematically zeroed.
@@ -141,14 +152,21 @@ def main():
     new_rel_pos = ax.pos_vel_mapper.pos_rel
     print(f"  ✔ Verified relative position is now: {new_rel_pos:.4f}")
 
-    # ── Save to flash ────────────────────────────────────────────
+    # ── Save to flash and reboot ─────────────────────────────────
     # The S1 may disconnect during save — this is expected behavior.
+    # Reboot ensures the new offset is loaded cleanly from flash.
     print(f"  Saving to flash...")
     try:
         odrv.save_configuration()
         print(f"  ✔ Save completed.")
     except Exception:
         print(f"  ℹ Device disconnected during save (expected behavior on S1).")
+
+    print(f"  Rebooting ODrive...")
+    try:
+        odrv.reboot()
+    except Exception:
+        print(f"  ℹ Device disconnected during reboot (expected behavior on S1).")
 
     # ── Remind user to complete the OpenFFBoard side ─────────────
     # The ODrive offset is only half the story. OpenFFBoard also

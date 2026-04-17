@@ -67,7 +67,7 @@ except (ImportError, AttributeError):
 
 # ── Motor core (from datasheet) ──────────────────────────────────
 POLE_PAIRS              = 21        # Datasheet: 21 pole pairs
-TORQUE_CONSTANT         = 1.00      # Datasheet: 1.00 Nm/A (motor-only, no gear ratio)
+TORQUE_CONSTANT         = 1.45      # Static test: 8.27 / KV 5.7 = 1.45 Nm/A (confirmed empirically)
 PHASE_RESISTANCE        = 0.439     # Datasheet: 0.439 Ω phase-to-phase
 EXPECTED_PHASE_R_LTN    = 0.439     # S1 0.6.11 stores phase-to-phase value
 PHASE_R_TOLERANCE       = 0.10      # Ω — measured variation tolerance
