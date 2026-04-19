@@ -12,6 +12,7 @@ USAGE:
     python odrive_center.py             # Interactive axis selection
     python odrive_center.py --pitch     # Center pitch axis
     python odrive_center.py --roll      # Center roll axis
+    python odrive_center.py --pitch --backup  # Center with full config backup
 
 PREREQUISITES:
     - Stick is fully assembled and free to move
@@ -24,8 +25,36 @@ REQUIREMENTS: pip install odrive  (Python 3.13 — 3.14 is NOT compatible)
 import odrive
 from odrive.enums import AxisState
 import argparse
+import os
+import shutil
+import subprocess
 import sys
 import time
+from datetime import datetime
+
+
+# ── Backup directory ─────────────────────────────────────────────
+# Same location as odrive_setup.py so all backups are in one place.
+BACKUP_DIR = os.path.join(os.path.expanduser("~"), "odrive_backups")
+
+
+def find_odrivetool():
+    """
+    WHAT: Locate the odrivetool executable across platforms.
+    WHY: On Windows, subprocess can't always find venv scripts via PATH
+         alone. This function checks PATH first, then falls back to the
+         Scripts directory alongside the current Python executable.
+    RETURNS: Full path to odrivetool, or None if not found.
+    """
+    path = shutil.which("odrivetool")
+    if path:
+        return path
+    scripts_dir = os.path.dirname(sys.executable)
+    for name in ["odrivetool", "odrivetool.exe"]:
+        candidate = os.path.join(scripts_dir, name)
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 def get_mapped_position(ax):
@@ -59,6 +88,8 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--pitch", action="store_true")
     group.add_argument("--roll", action="store_true")
+    parser.add_argument("--backup", action="store_true",
+                        help="Create full config backup before centering")
     args = parser.parse_args()
 
     if args.pitch:
@@ -74,6 +105,32 @@ def main():
             sys.exit(1)
 
     print(f"\n  ODrive Center Position — {axis_name.upper()}")
+
+    # ── Optional backup before centering ─────────────────────────
+    # save_configuration() saves ALL RAM to flash, not just the offset.
+    # Use --backup if you've made manual odrivetool changes you want
+    # to preserve before the centering save overwrites flash.
+    if args.backup:
+        print(f"  Creating backup before centering...")
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d")
+        backup_path = os.path.join(BACKUP_DIR, f"{axis_name}_{ts}_pre-center.json")
+        odrivetool = find_odrivetool()
+        if odrivetool is None:
+            print(f"  ⚠ odrivetool not found — skipping backup.")
+        else:
+            try:
+                result = subprocess.run(
+                    [odrivetool, "backup-config", backup_path],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0 and os.path.exists(backup_path):
+                    print(f"  ✔ Backup: {backup_path}")
+                else:
+                    print(f"  ⚠ Backup failed — continuing without backup.")
+            except Exception:
+                print(f"  ⚠ Backup skipped (odrivetool error).")
+
     print(f"  Searching for ODrive...")
     odrv = odrive.find_any(timeout=15)
     if odrv is None:
@@ -137,7 +194,7 @@ def main():
     # offset: new_offset = current_offset + (mapped_pos / scale)
     # This incremental approach works regardless of the current offset
     # state and correctly accounts for the gearbox scale factor.
-    current_offset = ax.pos_vel_mapper.config.offset
+    # current_offset was read and displayed before sampling (line above).
     scale = ax.pos_vel_mapper.config.scale
     new_offset = current_offset + (mapped_pos / scale)
 

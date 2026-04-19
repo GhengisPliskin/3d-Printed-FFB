@@ -13,7 +13,8 @@ USAGE:
     python odrive_verify.py             # Interactive axis selection
     python odrive_verify.py --pitch     # Verify pitch axis
     python odrive_verify.py --roll      # Verify roll axis
-    python odrive_verify.py --skip-torque  # Skip the torque symmetry test
+    python odrive_verify.py --skip-torque      # Skip torque symmetry test
+    python odrive_verify.py --skip-deflection  # Skip encoder deflection sweep
 
 REQUIREMENTS: pip install odrive  (Python 3.13 — 3.14 is NOT compatible)
 
@@ -32,6 +33,7 @@ from odrive.enums import (
 )
 import argparse
 import atexit
+import math
 import signal
 import sys
 import time
@@ -62,7 +64,7 @@ EXPECTED = {
     "phase_r_tol": 0.10,           # Tolerance for measured vs datasheet
 
     # Gearbox — 8:1 planetary
-    "scale": 0.125,                # 1/8 = pos_vel_mapper.scale
+    "scale": 1.0,                  # Motor turns — OpenFFB prescaler handles gearbox
 
     # Controller gains — AUDIT-corrected from RMDX8 Pro V2 reference
     "vel_gain": 3.0,               # AUDIT: was 0.02
@@ -70,13 +72,18 @@ EXPECTED = {
     "pos_gain": 38.0,              # AUDIT: was 15.0
     "vel_limit": 1000.0,           # AUDIT: was 1.0 (motor-side)
 
-    # Bandwidths — AUDIT-corrected
-    "current_ctrl_bw": 1000,       # AUDIT: was 150 Hz
-    "encoder_bw": 1000,            # AUDIT: was 200 Hz
+    # Bandwidths — confirmed through testing
+    "current_ctrl_bw": 150,        # FIX: confirmed 150 eliminates chatter on GIM
+    "encoder_bw": 1000,            # AUDIT: confirmed — lower causes lag oscillation
+
+    # Torque soft limits — FIX: attribute path is axis0.config, not
+    # axis0.controller.config. Confirmed via backup-config JSON diff.
+    "torque_soft_min": -7.0,       # Datasheet nominal torque bound
+    "torque_soft_max": 7.0,        # Datasheet nominal torque bound
 
     # Oscillation protection
     "watchdog_timeout": 0.05,
-    "torque_ramp_rate": 0.01,      # AUDIT: RMDX8 value (bypassed in passthrough)
+    "torque_ramp_rate": 50.0,      # FIX: confirmed — trim works, no chatter
 }
 
 CAN_NODE_IDS = {"pitch": 0, "roll": 1}
@@ -87,6 +94,16 @@ CAN_NODE_IDS = {"pitch": 0, "roll": 1}
 TORQUE_TEST_NM = 0.5
 TORQUE_HOLD_SEC = 2.0
 POSITION_DRIFT_TOL = 0.02
+
+# Encoder deflection test parameters.
+# The user manually moves the stick through full travel while the script
+# samples positions. We check for monotonicity, gap-free continuity,
+# and reasonable total travel range.
+DEFLECTION_SAMPLE_HZ = 50         # Sampling rate during sweep
+DEFLECTION_TIMEOUT_SEC = 15.0     # Max time for user to complete sweep
+DEFLECTION_MIN_TRAVEL = 0.05      # Minimum total travel (output-shaft turns)
+DEFLECTION_MAX_GAP = 0.02         # Max allowed position jump between samples
+DEFLECTION_REVERSAL_TOL = 0.005   # Ignore reversals smaller than this (noise)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -282,6 +299,22 @@ def test_config(ax, odrv, axis_name):
     if not odrv.config.brake_resistor0.enable:
         errors.append("brake_resistor OFF")
 
+    # Torque soft limits — attribute lives at axis0.config, not
+    # axis0.controller.config. If still at ±∞, the setup script
+    # wrote to the wrong path or firmware doesn't support them.
+    try:
+        tsmin = ax.config.torque_soft_min
+        tsmax = ax.config.torque_soft_max
+        if math.isinf(tsmin) or math.isinf(tsmax):
+            errors.append(f"torque_soft limits at default (±∞) — not set")
+        else:
+            if abs(tsmin - E["torque_soft_min"]) > 0.1:
+                errors.append(f"torque_soft_min={tsmin} (expected {E['torque_soft_min']})")
+            if abs(tsmax - E["torque_soft_max"]) > 0.1:
+                errors.append(f"torque_soft_max={tsmax} (expected {E['torque_soft_max']})")
+    except AttributeError:
+        pass  # Firmware doesn't expose these — not an error
+
     # Startup behavior — most common failure mode
     if not ax.config.startup_closed_loop_control:
         errors.append("startup_closed_loop=False")
@@ -306,14 +339,16 @@ def test_oscillation_protection(ax):
     issues = []
     info = []
 
-    # Current control bandwidth — AUDIT target: 1000 Hz
+    # Current control bandwidth — target: 150 Hz
+    # 1000 causes whine, 500 reduces whine but chatter persists,
+    # 150 eliminates chatter. Acts as natural low-pass on torque output.
     try:
         bw = ax.config.motor.current_control_bandwidth
         info.append(f"current_bw={bw}")
-        if bw < 500:
-            issues.append(f"current_ctrl_bw={bw} (should be ≥500, target 1000)")
-        elif bw > 2000:
-            issues.append(f"current_ctrl_bw={bw} (dangerously high, ≤1500 safe)")
+        if bw < 100:
+            issues.append(f"current_ctrl_bw={bw} (should be ≥100, target 150)")
+        elif bw > 1000:
+            issues.append(f"current_ctrl_bw={bw} (causes whine/chatter on GIM, target 150)")
     except AttributeError:
         info.append("current_bw=N/A")
 
@@ -409,6 +444,155 @@ def test_encoder_stability(ax):
     return result("Encoder stability", False, f"Drift {drift:.4f} t")
 
 
+def test_encoder_deflection(ax):
+    """
+    WHAT: Verify the encoder tracks position continuously through full
+          stick travel. The user manually sweeps the stick from one
+          physical stop to the other while the script samples position.
+    WHY: A bad encoder, loose magnet, or corrupted calibration can
+         produce correct readings at idle but introduce gaps, dropouts,
+         or reversals under movement. This test catches those failures
+         before OpenFFBoard starts sending torque commands against a
+         broken position signal.
+    ARGS: ax — ODrive axis object (must be in closed-loop torque mode
+          with zero input so the stick is free to move by hand).
+    RETURNS: Test result dict. Failure recommends recalibration.
+    FMEA: FM-002 — Encoder reliability under movement.
+          C-006 — Position accuracy prerequisite for centering.
+    """
+    # ── Pre-check: motor must be in closed loop with zero torque ──
+    # In TORQUE_CONTROL mode with input_torque=0, the motor offers
+    # no resistance and the stick moves freely while the encoder
+    # still tracks position.
+    if ax.current_state != AxisState.CLOSED_LOOP_CONTROL:
+        return result("Encoder deflection", False,
+                      f"Not in closed loop (state={ax.current_state})")
+
+    try:
+        ax.controller.input_torque = 0
+    except Exception:
+        pass
+
+    # ── Prompt user ──────────────────────────────────────────────
+    print(f"\n  ── Encoder Deflection Sweep ──")
+    print(f"  Slowly move the stick from one physical stop to the other.")
+    print(f"  You have {DEFLECTION_TIMEOUT_SEC:.0f} seconds. Sampling starts")
+    print(f"  when movement is detected.")
+    print(f"  Press Enter to begin...", end="")
+    input()
+
+    # ── Wait for movement to start ───────────────────────────────
+    # Sit at idle and watch for the position to change beyond noise.
+    # This avoids recording a bunch of stationary samples at the start.
+    baseline = get_position(ax)
+    interval = 1.0 / DEFLECTION_SAMPLE_HZ
+    started = False
+    start_time = time.monotonic()
+    positions = []
+    timestamps = []
+
+    print(f"  Waiting for movement...", end="", flush=True)
+
+    while (time.monotonic() - start_time) < DEFLECTION_TIMEOUT_SEC:
+        pos = get_position(ax)
+        time.sleep(interval)
+
+        if not started:
+            # Detect movement start: position moved beyond noise floor
+            if abs(pos - baseline) > DEFLECTION_REVERSAL_TOL * 3:
+                started = True
+                positions.append(baseline)
+                timestamps.append(0.0)
+                positions.append(pos)
+                timestamps.append(time.monotonic() - start_time)
+                print(f" recording.", flush=True)
+            continue
+
+        positions.append(pos)
+        timestamps.append(time.monotonic() - start_time)
+
+        # Detect movement stop: last 10 samples are all within noise
+        if len(positions) >= 15:
+            recent = positions[-10:]
+            recent_spread = max(recent) - min(recent)
+            if recent_spread < DEFLECTION_REVERSAL_TOL:
+                print(f"  Movement stopped — sweep complete.")
+                break
+    else:
+        if not started:
+            return result("Encoder deflection", False,
+                          "No movement detected — timed out")
+        print(f"  Timeout reached — analyzing what was recorded.")
+
+    # ── Analyze the sweep ────────────────────────────────────────
+    n = len(positions)
+    if n < 5:
+        return result("Encoder deflection", False,
+                      f"Only {n} samples — insufficient data")
+
+    total_travel = abs(positions[-1] - positions[0])
+    issues = []
+    info = []
+
+    # Check 1: minimum total travel
+    if total_travel < DEFLECTION_MIN_TRAVEL:
+        issues.append(f"travel={total_travel:.4f}t (min {DEFLECTION_MIN_TRAVEL})")
+
+    # Check 2: gaps between consecutive samples
+    # A gap indicates the encoder lost track or skipped counts.
+    max_gap = 0.0
+    gap_count = 0
+    for i in range(1, n):
+        gap = abs(positions[i] - positions[i-1])
+        if gap > max_gap:
+            max_gap = gap
+        if gap > DEFLECTION_MAX_GAP:
+            gap_count += 1
+
+    if gap_count > 0:
+        issues.append(f"{gap_count} gap(s) > {DEFLECTION_MAX_GAP}t "
+                      f"(worst={max_gap:.4f}t)")
+
+    # Check 3: monotonicity — no large reversals
+    # Determine sweep direction from overall movement, then count
+    # samples that reverse against that direction beyond noise.
+    sweep_positive = positions[-1] > positions[0]
+    reversal_count = 0
+    worst_reversal = 0.0
+    for i in range(1, n):
+        delta = positions[i] - positions[i-1]
+        if sweep_positive and delta < -DEFLECTION_REVERSAL_TOL:
+            reversal_count += 1
+            if abs(delta) > worst_reversal:
+                worst_reversal = abs(delta)
+        elif not sweep_positive and delta > DEFLECTION_REVERSAL_TOL:
+            reversal_count += 1
+            if abs(delta) > worst_reversal:
+                worst_reversal = abs(delta)
+
+    if reversal_count > 3:
+        issues.append(f"{reversal_count} reversals "
+                      f"(worst={worst_reversal:.4f}t)")
+
+    info.append(f"{n} samples")
+    info.append(f"travel={total_travel:.4f}t")
+    info.append(f"max_gap={max_gap:.4f}t")
+    info.append(f"reversals={reversal_count}")
+
+    detail = ", ".join(info)
+
+    if issues:
+        return result("Encoder deflection", False,
+                      f"RECALIBRATE — {'; '.join(issues)} [{detail}]")
+
+    # Mild warning if any reversals at all (could be user hesitation)
+    if reversal_count > 0:
+        return result("Encoder deflection", None,
+                      f"Minor reversals (user hesitation?) — {detail}")
+
+    return result("Encoder deflection", True, detail)
+
+
 def test_power(odrv):
     """
     WHAT: Verify power protection settings are configured for 48V operation.
@@ -502,7 +686,7 @@ def test_torque_symmetry(ax):
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════
 
-def run_tests(axis_name, skip_torque=False):
+def run_tests(axis_name, skip_torque=False, skip_deflection=False):
     """
     WHAT: Execute the full verification test suite for one axis.
     WHY: Validates that odrive_setup.py produced a correctly configured
@@ -511,6 +695,7 @@ def run_tests(axis_name, skip_torque=False):
     ARGS:
         axis_name: "pitch" or "roll".
         skip_torque: If True, skip the torque symmetry test.
+        skip_deflection: If True, skip the encoder deflection sweep test.
     RETURNS: True if no failures, False if any test failed.
     FMEA: FM-002, FM-006 — Post-setup validation.
     """
@@ -615,6 +800,19 @@ def run_tests(axis_name, skip_torque=False):
     except AttributeError:
         print(f"  ℹ Anti-cogging: not available on this firmware")
 
+    # ── Encoder deflection sweep — requires user interaction ─────
+    # This test asks the user to physically move the stick through
+    # full travel. If the encoder loses track, it recommends
+    # recalibrating the motor/encoder.
+    if not skip_deflection:
+        print(f"\n  Deflection sweep: manually move stick through full travel.")
+        print(f"  Enter to run, 's' to skip: ", end="")
+        if input().strip().lower() != 's':
+            results.append(run_test("Encoder deflection",
+                                    test_encoder_deflection, ax))
+    else:
+        print(f"\n  Encoder deflection test skipped.")
+
     # ── Optional torque symmetry test ────────────────────────────
     if not skip_torque:
         print(f"\n  Torque test applies {TORQUE_TEST_NM} Nm to motor. Ctrl+C = stop.")
@@ -641,6 +839,16 @@ def run_tests(axis_name, skip_torque=False):
         for r in results:
             if r["passed"] is False:
                 print(f"    ✘ {r['name']}: {r['msg']}")
+
+        # If encoder deflection failed, recommend recalibration
+        deflection_failed = any(
+            r["passed"] is False and r["name"] == "Encoder deflection"
+            for r in results
+        )
+        if deflection_failed:
+            print(f"\n  ⚠ Encoder deflection failure detected.")
+            print(f"    Recommended action: re-run odrive_setup.py to")
+            print(f"    recalibrate motor and encoder.")
     print(f"{'='*60}\n")
     return f == 0
 
@@ -656,7 +864,10 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--pitch", action="store_true")
     group.add_argument("--roll", action="store_true")
-    parser.add_argument("--skip-torque", action="store_true")
+    parser.add_argument("--skip-torque", action="store_true",
+                        help="Skip the torque symmetry test")
+    parser.add_argument("--skip-deflection", action="store_true",
+                        help="Skip the encoder deflection sweep test")
     args = parser.parse_args()
 
     if args.pitch:
@@ -670,7 +881,8 @@ def main():
         if not axis_name:
             sys.exit(1)
 
-    sys.exit(0 if run_tests(axis_name, args.skip_torque) else 1)
+    sys.exit(0 if run_tests(axis_name, args.skip_torque,
+                            args.skip_deflection) else 1)
 
 
 if __name__ == "__main__":

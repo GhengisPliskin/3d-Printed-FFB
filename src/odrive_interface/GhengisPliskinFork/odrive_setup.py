@@ -14,7 +14,8 @@ USAGE:
     python odrive_setup.py              # Interactive axis selection
     python odrive_setup.py --pitch      # Pitch axis (CAN node 0)
     python odrive_setup.py --roll       # Roll axis  (CAN node 1)
-    python odrive_setup.py --pitch --anticogging  # Include anti-cogging cal
+    python odrive_setup.py --pitch --anticogging       # Full setup + anti-cogging
+    python odrive_setup.py --pitch --anticogging-only  # Anti-cogging only (already calibrated)
 
 FIRMWARE: ODrive S1, 0.6.11 (master)
 REQUIREMENTS: pip install odrive  (Python 3.13 — 3.14 is NOT compatible)
@@ -38,7 +39,9 @@ import atexit
 import json
 import math
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -81,9 +84,14 @@ CURRENT_HARD_MAX        = 25.0      # Datasheet stall: 25A
 
 # ── Gearbox (from datasheet) ────────────────────────────────────
 # The 8:1 planetary gearbox means one output-shaft turn = 8 motor turns.
-# pos_vel_mapper.scale converts motor-side units to output-shaft units.
+# pos_vel_mapper.scale is set to 1.0 (motor turns) — the same convention
+# the RMDX8 Pro V2 and working GIM builds use. OpenFFBoard's 1:8 encoder
+# prescaler handles the gearbox conversion on the OpenFFBoard side.
+# Previously 0.125 (1/8), which converted to output-shaft turns on the
+# ODrive side. Changed to 1.0 to match both reference builds and simplify
+# the CAN position pipeline.
 GEARBOX_RATIO           = 8
-POS_VEL_MAPPER_SCALE    = 1.0 / GEARBOX_RATIO  # = 0.125
+POS_VEL_MAPPER_SCALE    = 1.0      # FIX: was 0.125 — motor turns, prescaler on OpenFFB
 
 # ── Calibration parameters ───────────────────────────────────────
 # AUDIT #4 note: resistance_calib_max_voltage was 4.0V on the GIM vs
@@ -110,14 +118,18 @@ FLUX_LINKAGE                    = 0.14
 FLUX_LINKAGE_VALID              = True
 FIELD_WEAKENING_ENABLE          = False
 
-# AUDIT #5: current_slew_rate_limit was 800 A/s on GIM vs 10,000 on
-# RMDX8. At 800 A/s, the GIM takes ~8.75ms to reach full current —
-# 12.5x slower than the RMDX8's 0.7ms. Force transitions feel mushy.
-CURRENT_SLEW_RATE_LIMIT         = 10_000.0  # AUDIT: raised from 800
+# AUDIT #5: current_slew_rate_limit — originally raised from 800 to
+# 10,000 to match RMDX8. However, the working GIM uses 800 without
+# issues, and 10,000 allows current transients sharp enough to produce
+# audible chatter on the low-inertia GIM 8108-8 (45.5 gcm² vs RMDX8's
+# 3400 gcm²). Reverted to 800 per working GIM backup-config diff.
+CURRENT_SLEW_RATE_LIMIT         = 800.0     # FIX: was 10,000 — reverted to working GIM
 
-# AUDIT: power/torque reporting bandwidth was 150 Hz vs RMDX8's 8000 Hz.
-# Lower bandwidth means the host (OpenFFBoard) gets stale force telemetry.
-POWER_TORQUE_REPORT_FILTER_BW   = 8000.0    # AUDIT: raised from 150
+# AUDIT: power/torque reporting bandwidth — originally raised from 150
+# to 8000 to match RMDX8. At 8000 Hz, the GIM passes high-frequency
+# noise through torque reporting that the RMDX8's massive rotor inertia
+# naturally absorbs. Reverted to 150 per working GIM backup-config diff.
+POWER_TORQUE_REPORT_FILTER_BW   = 150.0     # FIX: was 8000 — reverted to working GIM
 
 # ── Controller gains ─────────────────────────────────────────────
 # AUDIT #1: vel_gain was 0.02 on GIM vs 3.0 on RMDX8 (150x delta).
@@ -145,21 +157,34 @@ INPUT_FILTER_BW         = 20.0     # AUDIT: lowered from 100 (RMDX8 = 20)
 
 # ── Encoder bandwidth ────────────────────────────────────────────
 # AUDIT #10: encoder_bandwidth was 200 Hz on GIM vs 1000 Hz on RMDX8.
-# Lower encoder bandwidth = noisier velocity estimation, which
-# compounds the already-low vel_gain problem.
-ENCODER_BW              = 1000     # AUDIT: raised from 700 (RMDX8 = 1000)
-COMMUTATION_ENC_BW      = 1000     # Match encoder_bandwidth
+# Tested 200, 300, 500, and 1000 — lower values caused phase-lag
+# oscillation worse than quantization chatter at 1000. Keep at 1000.
+ENCODER_BW              = 1000     # AUDIT: confirmed 1000 — lower causes lag oscillation
+
+# CAUTION: commutation_encoder_bandwidth must stay at firmware default
+# (NaN). Setting it explicitly crashed closed loop during testing.
+# The working GIM also uses NaN. Do NOT set this parameter.
+# COMMUTATION_ENC_BW is intentionally omitted.
 
 # ── Current loop bandwidth ───────────────────────────────────────
 # AUDIT #4: current_control_bandwidth was 150 Hz on GIM vs 1000 Hz
-# on RMDX8 (6.7x). The current loop governs torque tracking accuracy.
-# At 150 Hz the motor can't follow rapid force changes.
-CURRENT_CONTROL_BW      = 1000     # AUDIT: raised from 200 (RMDX8 = 1000)
+# on RMDX8. The GIM's low rotor inertia (45.5 gcm²) faithfully
+# reproduces high-frequency torque variations that the RMDX8's
+# 3400 gcm² flywheel mechanically absorbs. Tested 150, 500, 1000:
+# 1000 causes motor whine, 500 reduces whine but chatter persists,
+# 150 eliminates chatter entirely. At 150 the current loop acts as
+# a natural low-pass on torque output — the same mechanism that made
+# the pre-audit config chatter-free. Combined with torque_ramp_rate=50
+# this gives responsive trim without chatter.
+CURRENT_CONTROL_BW      = 150      # FIX: confirmed 150 eliminates chatter
 
 # ── Torque ramp and soft limits ──────────────────────────────────
-# AUDIT #11: torque_ramp_rate is bypassed in PASSTHROUGH input mode.
-# Setting it anyway as a safety net in case input mode changes.
-TORQUE_RAMP_RATE        = 0.01     # AUDIT: RMDX8 value (bypassed in passthrough)
+# AUDIT #11: torque_ramp_rate — 0.01 killed trim entirely, 105 (working
+# GIM value) restored trim but allowed chatter. 50 Nm/s is the confirmed
+# sweet spot: fast enough for trim response (~0.14s to reach 7 Nm),
+# slow enough to filter the high-frequency force steps that cause chatter
+# on the GIM's low-inertia rotor.
+TORQUE_RAMP_RATE        = 50.0     # FIX: confirmed — trim works, no chatter
 
 # AUDIT: RMDX8 has explicit torque soft limits (±31.25 Nm). The GIM
 # had no limits set. Adding ±7.0 Nm based on datasheet nominal torque.
@@ -390,52 +415,78 @@ def validate_vbus(odrv):
 #  CONFIG BACKUP
 # ═══════════════════════════════════════════════════════════════════
 
-def backup_config(odrv, axis_name):
+def find_odrivetool():
     """
-    WHAT: Save the current ODrive configuration to a JSON file.
-    WHY: Before erasing to factory defaults, preserve the existing config
-         so it can be manually restored if the new config causes problems.
-         Backups are not auto-restorable — they serve as reference.
+    WHAT: Locate the odrivetool executable across platforms.
+    WHY: On Windows, subprocess can't always find venv scripts via PATH
+         alone. This function checks PATH first, then falls back to the
+         Scripts directory alongside the current Python executable.
+    RETURNS: Full path to odrivetool, or None if not found.
+    """
+    path = shutil.which("odrivetool")
+    if path:
+        return path
+    scripts_dir = os.path.dirname(sys.executable)
+    for name in ["odrivetool", "odrivetool.exe"]:
+        candidate = os.path.join(scripts_dir, name)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def backup_config(axis_name):
+    """
+    WHAT: Run odrivetool backup-config to save the ENTIRE current ODrive
+          configuration to a dated JSON file before making changes.
+    WHY: A partial backup of key parameters is not enough — any value
+         could cause problems if changed. Full backups allow complete
+         restore with odrivetool restore-config if something goes wrong.
+         Filename includes axis name and date so historical backups
+         accumulate instead of being overwritten.
     ARGS:
-        odrv: Connected ODrive instance.
         axis_name: "pitch" or "roll" — used in the backup filename.
-    RETURNS: None. Prints the backup filepath on success.
-    FMEA: N/A
+    RETURNS: True if backup succeeded, False if it failed.
+    FMEA: N/A — defensive measure, not safety-critical.
     """
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    sn = getattr(odrv, 'serial_number', 'unknown')
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = os.path.join(BACKUP_DIR, f"odrive_{axis_name}_{sn}_{ts}.json")
+    ts = datetime.now().strftime("%Y-%m-%d")
+    filename = f"{axis_name}_{ts}_backup.json"
+    filepath = os.path.join(BACKUP_DIR, filename)
+
+    print(f"\n  Creating full config backup before changes...")
+    print(f"  Target: {filepath}")
+
+    odrivetool = find_odrivetool()
+    if odrivetool is None:
+        print(f"  ⚠ odrivetool not found — skipping backup.")
+        print(f"    Ensure the venv is active: C:\\odrive_env\\Scripts\\activate")
+        return False
+
     try:
-        ax = odrv.axis0
-        m = ax.config.motor
-        c = ax.controller.config
-        backup = {
-            "serial_number": str(sn), "axis_name": axis_name, "timestamp": ts,
-            "vbus_voltage": float(odrv.vbus_voltage),
-            "motor": {
-                "pole_pairs": int(m.pole_pairs),
-                "torque_constant": float(m.torque_constant),
-                "current_soft_max": float(m.current_soft_max),
-                "current_hard_max": float(m.current_hard_max),
-                "phase_resistance": float(m.phase_resistance) if m.phase_resistance else None,
-            },
-            "controller": {
-                "control_mode": int(c.control_mode),
-                "pos_gain": float(c.pos_gain),
-                "vel_gain": float(c.vel_gain),
-                "vel_integrator_gain": float(c.vel_integrator_gain),
-            },
-            "can": {
-                "baud_rate": int(odrv.can.config.baud_rate),
-                "node_id": int(ax.config.can.node_id),
-            },
-        }
-        with open(filepath, 'w') as f:
-            json.dump(backup, f, indent=2)
-        print(f"  ✔ Backup: {filepath}")
+        result = subprocess.run(
+            [odrivetool, "backup-config", filepath],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0 and os.path.exists(filepath):
+            size = os.path.getsize(filepath)
+            print(f"  ✔ Backup saved ({size:,} bytes)")
+            print(f"    Restore with: odrivetool restore-config {filepath}")
+            return True
+        else:
+            stderr = result.stderr.strip() if result.stderr else "unknown error"
+            print(f"  ⚠ Backup command failed: {stderr}")
+            print(f"    Continuing without backup.")
+            return False
+    except FileNotFoundError:
+        print(f"  ⚠ odrivetool not found in PATH — skipping backup.")
+        print(f"    Install with: pip install odrive")
+        return False
+    except subprocess.TimeoutExpired:
+        print(f"  ⚠ Backup timed out (no ODrive found?) — skipping.")
+        return False
     except Exception as e:
         print(f"  ⚠ Backup failed: {e}")
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -493,13 +544,14 @@ def phase1_configure(odrv, axis_name):
     ax.config.load_encoder                    = ONBOARD_ENC
     ax.config.commutation_encoder             = ONBOARD_ENC
     ax.config.encoder_bandwidth               = ENCODER_BW
-    ax.config.commutation_encoder_bandwidth   = COMMUTATION_ENC_BW
+    # DO NOT SET commutation_encoder_bandwidth — leave at firmware default.
+    # Setting it explicitly crashed closed loop during testing. Working
+    # GIM and RMDX8 both use NaN (firmware default).
 
     # ── Gearbox — 8:1 planetary reducer ─────────────────────────
-    # AUDIT #8: pos_vel_mapper.scale = 0.125 on GIM vs 1.0 on RMDX8.
-    # This is correct for the GIM's 8:1 gearbox — it converts motor-side
-    # units to output-shaft units. The RMDX8 uses 1.0 because its
-    # ODrive config already accounts for the 9:1 ratio elsewhere.
+    # Scale = 1.0 reports motor turns over CAN. OpenFFBoard's 1:8
+    # encoder prescaler converts to output-shaft units. Both the
+    # RMDX8 reference and working GIM use scale=1.0.
     ax.pos_vel_mapper.config.scale            = POS_VEL_MAPPER_SCALE
 
     # ── Controller (AUDIT: primary source of broken trim) ────────
@@ -521,10 +573,12 @@ def phase1_configure(odrv, axis_name):
 
     # AUDIT: torque soft limits — RMDX8 has ±31.25 Nm, GIM had none.
     # Setting ±7.0 Nm based on datasheet nominal torque as a safety bound.
-    safe_set(ax.controller.config, 'torque_soft_min', TORQUE_SOFT_MIN,
-             "controller.config.torque_soft_min")
-    safe_set(ax.controller.config, 'torque_soft_max', TORQUE_SOFT_MAX,
-             "controller.config.torque_soft_max")
+    # FIX: attribute lives at axis0.config, not axis0.controller.config.
+    # Confirmed via backup-config JSON from both RMDX8 and GIM builds.
+    safe_set(ax.config, 'torque_soft_min', TORQUE_SOFT_MIN,
+             "config.torque_soft_min")
+    safe_set(ax.config, 'torque_soft_max', TORQUE_SOFT_MAX,
+             "config.torque_soft_max")
 
     # ── Current loop and oscillation protection ──────────────────
     # AUDIT #4: current_control_bandwidth was 150 Hz vs RMDX8's 1000 Hz.
@@ -1215,6 +1269,12 @@ def setup_axis(axis_name, run_anticogging=False):
     print(f"  Press Enter...", end="")
     input()
 
+    # ── Backup current config BEFORE connecting ──────────────────
+    # Uses odrivetool subprocess so it doesn't conflict with our
+    # odrive.find_any() connection. Backup runs first, disconnects,
+    # then we connect normally.
+    backup_config(axis_name)
+
     odrv = connect_odrive()
     if odrv is None:
         return False
@@ -1223,8 +1283,6 @@ def setup_axis(axis_name, run_anticogging=False):
     if not validate_vbus(odrv):
         _active_odrv = None
         return False
-
-    backup_config(odrv, axis_name)
 
     # ── Erase to factory defaults ────────────────────────────────
     # Starting from a clean slate prevents stale config values from
@@ -1294,10 +1352,112 @@ def setup_axis(axis_name, run_anticogging=False):
     return verified
 
 
+def anticogging_only(axis_name):
+    """
+    WHAT: Run harmonic compensation + anticogging calibration on an
+          already-configured and calibrated ODrive. Does NOT erase config
+          or re-run motor/encoder calibration.
+    WHY: Anticogging can be re-run independently after the initial setup,
+         e.g. if the motor was reassembled, the anticogging map degraded,
+         or you want to try different anticogging parameters. This avoids
+         the full erase-configure-calibrate cycle.
+    ARGS:
+        axis_name: "pitch" or "roll".
+    RETURNS: True if anticogging completed and saved, False on failure.
+    FMEA: FM-001 — Cogging compensation affects force profile quality.
+    """
+    global _active_odrv
+
+    print(f"\n{'='*60}")
+    print(f"  ODrive S1 Anti-cogging Only — {axis_name.upper()}")
+    print(f"  Runs harmonic compensation + anticogging sweep")
+    print(f"  on an already-calibrated drive.")
+    print(f"{'='*60}")
+    print(f"  Connect the {axis_name} ODrive via USB. PSU on at 48V.")
+    print(f"  Motor must be FREE TO SPIN, no biased load.")
+    print(f"  Press Enter...", end="")
+    input()
+
+    # ── Backup before changes ────────────────────────────────────
+    backup_config(axis_name)
+
+    odrv = connect_odrive()
+    if odrv is None:
+        return False
+    _active_odrv = odrv
+
+    if not validate_vbus(odrv):
+        _active_odrv = None
+        return False
+
+    ax = odrv.axis0
+
+    # ── Verify drive is already calibrated ───────────────────────
+    # Phase resistance must be valid — if not, the drive hasn't been
+    # through full calibration and anticogging will fail.
+    if not ax.config.motor.phase_resistance_valid:
+        print(f"  ✘ Motor not calibrated (phase_resistance_valid=False).")
+        print(f"    Run full setup first: python odrive_setup.py --{axis_name} --anticogging")
+        _active_odrv = None
+        return False
+
+    r = ax.config.motor.phase_resistance
+    print(f"  ✔ Drive already calibrated (phase_resistance={r:.4f} Ω)")
+
+    # ── Run harmonic + anticogging ───────────────────────────────
+    print(f"\n{'─'*60}")
+    print(f"  Anti-cogging Calibration [{axis_name.upper()}]")
+    print(f"  (includes harmonic compensation — ~8 minutes total)")
+    print(f"{'─'*60}")
+
+    _run_anticogging_sequence(odrv, ax)
+
+    # ── Save to flash ────────────────────────────────────────────
+    print(f"\n  Setting startup behavior...")
+    ax.config.startup_closed_loop_control = True
+    ax.config.startup_motor_calibration = False
+    ax.config.startup_encoder_offset_calibration = False
+
+    print(f"  Saving to flash...")
+    try:
+        odrv.save_configuration()
+        print(f"  ✔ Save completed.")
+    except Exception:
+        print(f"  ℹ Device disconnected during save (common on S1).")
+
+    # ── Reconnect and verify anticogging persisted ───────────────
+    print(f"\n  Reconnecting to verify...")
+    time.sleep(3)
+    odrv = connect_odrive(timeout=20)
+    if odrv is None:
+        print(f"  ⚠ Could not reconnect — anticogging likely saved.")
+        _active_odrv = None
+        return True
+
+    _active_odrv = odrv
+    ax = odrv.axis0
+
+    try:
+        ac_enabled = ax.config.anticogging.enabled
+        print(f"  ✔ anticogging.enabled: {ac_enabled}")
+        cosx = ax.config.harmonic_compensation.cosx_coef
+        sinx = ax.config.harmonic_compensation.sinx_coef
+        print(f"  ✔ harmonic: cosx={cosx:.6f}, sinx={sinx:.6f}")
+    except AttributeError:
+        print(f"  ⚠ Could not verify anticogging/harmonic values.")
+
+    _active_odrv = None
+    return True
+
+
 def main():
     """
     WHAT: CLI entry point — parse arguments and run setup for one axis.
-    WHY: Provides both interactive and command-line axis selection.
+    WHY: Provides both interactive and command-line axis selection with
+         three operational modes:
+         - Default: full config + motor/encoder calibration
+         - --anticogging: full config + calibration + harmonic + anticogging
+         - --anticogging-only: harmonic + anticogging on already-calibrated drive
     RETURNS: None. Exits with code 0 on success, 1 on failure.
     FMEA: N/A
     """
@@ -1306,8 +1466,12 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--pitch", action="store_true")
     group.add_argument("--roll", action="store_true")
-    parser.add_argument("--anticogging", action="store_true",
-                        help="Run anti-cogging calibration (~6 extra minutes)")
+    acog_group = parser.add_mutually_exclusive_group()
+    acog_group.add_argument("--anticogging", action="store_true",
+                        help="Full setup + anti-cogging calibration (~6 extra min)")
+    acog_group.add_argument("--anticogging-only", action="store_true",
+                        help="Run only harmonic + anti-cogging (drive must be "
+                             "already calibrated)")
     args = parser.parse_args()
 
     if args.pitch:
@@ -1321,15 +1485,21 @@ def main():
         if not axis_name:
             sys.exit(1)
 
-    success = setup_axis(axis_name, run_anticogging=args.anticogging)
+    if args.anticogging_only:
+        success = anticogging_only(axis_name)
+    else:
+        success = setup_axis(axis_name, run_anticogging=args.anticogging)
 
     print(f"\n{'='*60}")
     print(f"  {axis_name.upper()}: {'✔ PASS' if success else '✘ FAIL'}")
-    if success:
+    if success and not args.anticogging_only:
         print(f"\n  NEXT STEPS:")
         print(f"  1. Reassemble the stick")
         print(f"  2. Run: python odrive_center.py --{axis_name}")
         print(f"  3. Connect OpenFFBoard and verify CAN comms")
+    elif success and args.anticogging_only:
+        print(f"\n  Anti-cogging calibration complete.")
+        print(f"  No further steps needed — centering is preserved.")
     print(f"{'='*60}\n")
     sys.exit(0 if success else 1)
 
